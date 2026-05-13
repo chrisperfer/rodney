@@ -740,6 +740,7 @@ func cmdJS(args []string) {
 	fs := flag.NewFlagSet("js", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	file := fs.String("file", "", "")
+	timeoutSec := fs.Int("timeout", 0, "")
 	if err := fs.Parse(args); err != nil {
 		fatal("invalid flag: %v", err)
 	}
@@ -770,11 +771,19 @@ func cmdJS(args []string) {
 	}
 
 	_, _, page := withPage()
+	if *timeoutSec > 0 {
+		page = page.Timeout(time.Duration(*timeoutSec) * time.Second)
+	}
 
-	// Wrap bare expressions in a function
+	// Wrap bare expressions in a function. Page.Eval already awaits a
+	// returned Promise (AwaitPromise=true under the hood), so users can
+	// return a Promise from <expr> without ceremony.
 	js := fmt.Sprintf(`() => { return (%s); }`, expr)
 	result, err := page.Eval(js)
 	if err != nil {
+		if *timeoutSec > 0 && strings.Contains(err.Error(), "context deadline exceeded") {
+			fatal("JS timeout after %ds (use --timeout 0 or a larger value to extend)", *timeoutSec)
+		}
 		fatal("JS error: %v", err)
 	}
 	// Print the value based on its JSON type

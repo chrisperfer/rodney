@@ -22,7 +22,9 @@ Page info:
   rodney pdf [file]               Save page as PDF
 
 Interaction:
-  rodney js <expr>|-|--file <p>   Evaluate JS (- reads stdin, --file reads from path)
+  rodney js <expr>|-|--file <p>   Evaluate JS. Awaits returned Promises.
+                                  '-' reads stdin; --file <p> reads from path.
+                                  --timeout <s> bounds the wait (0 = unbounded)
   rodney click <selector>         Click an element
   rodney input <selector> <text>  Type text into an input field
   rodney clear <selector>         Clear an input field
