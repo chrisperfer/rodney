@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -79,12 +81,13 @@ func resolveStateDir(mode scopeMode, workingDir string) string {
 
 // State persisted between CLI invocations
 type State struct {
-	DebugURL    string `json:"debug_url"`
-	ChromePID   int    `json:"chrome_pid"`
-	ActivePage  int    `json:"active_page"`  // index into pages list
-	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	DebugURL         string `json:"debug_url"`
+	ChromePID        int    `json:"chrome_pid"`
+	ActivePage       int    `json:"active_page"` // index into pages list
+	DataDir          string `json:"data_dir"`
+	ProxyPID         int    `json:"proxy_pid,omitempty"`           // PID of auth proxy helper
+	ProxyPort        int    `json:"proxy_port,omitempty"`          // local port of auth proxy
+	ConsoleLoggerPID int    `json:"console_logger_pid,omitempty"` // PID of console-capture sidecar
 }
 
 func stateDir() string {
@@ -96,6 +99,10 @@ func stateDir() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".rodney")
+}
+
+func consoleLogPath() string {
+	return filepath.Join(stateDir(), "console.log")
 }
 
 func statePath() string {
@@ -207,6 +214,8 @@ func main() {
 	switch cmd {
 	case "_proxy":
 		cmdInternalProxy(args) // hidden: runs the auth proxy helper
+	case "_console_logger":
+		cmdInternalConsoleLogger(args) // hidden: runs the console-capture sidecar
 	case "start":
 		cmdStart(args)
 	case "connect":
@@ -293,6 +302,8 @@ func main() {
 		cmdAXFind(args)
 	case "ax-node":
 		cmdAXNode(args)
+	case "console":
+		cmdConsole(args)
 	case "help", "-h", "--help":
 		printUsage()
 		os.Exit(0)
@@ -434,13 +445,27 @@ func cmdStart(args []string) {
 	// Get Chrome PID from the launcher
 	pid := l.PID()
 
+	// Launch console-capture sidecar so 'rodney console' can replay output.
+	// Best-effort: if it fails to start, Chrome itself is still usable.
+	var consoleLoggerPID int
+	{
+		exe, _ := os.Executable()
+		ccmd := exec.Command(exe, "_console_logger", debugURL, consoleLogPath())
+		setSysProcAttr(ccmd)
+		if err := ccmd.Start(); err == nil {
+			consoleLoggerPID = ccmd.Process.Pid
+			ccmd.Process.Release()
+		}
+	}
+
 	state := &State{
-		DebugURL:   debugURL,
-		ChromePID:  pid,
-		ActivePage: 0,
-		DataDir:    dataDir,
-		ProxyPID:   proxyPID,
-		ProxyPort:  proxyPort,
+		DebugURL:         debugURL,
+		ChromePID:        pid,
+		ActivePage:       0,
+		DataDir:          dataDir,
+		ProxyPID:         proxyPID,
+		ProxyPort:        proxyPort,
+		ConsoleLoggerPID: consoleLoggerPID,
 	}
 
 	if err := saveState(state); err != nil {
@@ -520,6 +545,14 @@ func cmdStop(args []string) {
 	if s.ProxyPID > 0 {
 		if proc, err := os.FindProcess(s.ProxyPID); err == nil {
 			proc.Signal(syscall.SIGTERM)
+		}
+	}
+	if s.ConsoleLoggerPID > 0 {
+		if proc, err := os.FindProcess(s.ConsoleLoggerPID); err == nil {
+			// Use Kill rather than SIGTERM so this works cross-platform
+			// (SIGTERM is not delivered to processes on Windows). The
+			// sidecar has no graceful-shutdown logic worth waiting for.
+			_ = proc.Kill()
 		}
 	}
 	removeState()
@@ -2001,4 +2034,218 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, upstream, authHeader stri
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// consoleLogEntry is one JSON-Lines record written by the console sidecar.
+type consoleLogEntry struct {
+	TS    string `json:"ts"`              // RFC3339Nano UTC
+	Src   string `json:"src"`             // "console" | "exception"
+	Level string `json:"level"`           // log/info/warn/error/debug
+	Text  string `json:"text"`            // rendered message
+	Loc   string `json:"loc,omitempty"`   // url:line if available
+}
+
+// renderConsoleArg turns one RuntimeRemoteObject into a printable string.
+// Primitives use their JSON value; non-primitives use Description (the
+// canonical browser-side preview).
+func renderConsoleArg(a *proto.RuntimeRemoteObject) string {
+	if a == nil {
+		return ""
+	}
+	switch a.Type {
+	case "string":
+		return a.Value.Str()
+	case "number", "boolean":
+		return a.Value.JSON("", "")
+	case "undefined":
+		return "undefined"
+	case "object":
+		if a.Subtype == "null" {
+			return "null"
+		}
+		if a.Description != "" {
+			return a.Description
+		}
+		return a.Value.JSON("", "")
+	case "function":
+		if a.Description != "" {
+			// Just the signature line.
+			return strings.SplitN(a.Description, "\n", 2)[0]
+		}
+		return "function"
+	default:
+		if a.Description != "" {
+			return a.Description
+		}
+		return a.Value.JSON("", "")
+	}
+}
+
+// cmdInternalConsoleLogger is a hidden subcommand:
+//   rodney _console_logger <debug_url> <log_path>
+// It attaches to Chrome via CDP, subscribes to Runtime.consoleAPICalled +
+// Runtime.exceptionThrown for the whole browser, and appends each event as
+// a JSON line to <log_path>. It exits when Chrome dies or it is killed.
+func cmdInternalConsoleLogger(args []string) {
+	if len(args) < 2 {
+		os.Exit(2)
+	}
+	debugURL := args[0]
+	logPath := args[1]
+
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		os.Exit(2)
+	}
+	defer f.Close()
+
+	browser := rod.New().ControlURL(debugURL)
+	if err := browser.Connect(); err != nil {
+		os.Exit(2)
+	}
+
+	// rod does not auto-enable the Runtime domain on attached sessions, and
+	// console events only fire from sessions where Runtime.enable was called.
+	// Enable it on every currently-open page. Pages opened later (rodney
+	// newpage, popups) are picked up by the periodic refresh below.
+	enableRuntimeOnAllPages := func() {
+		if pages, err := browser.Pages(); err == nil {
+			for _, p := range pages {
+				_ = proto.RuntimeEnable{}.Call(p)
+			}
+		}
+	}
+	enableRuntimeOnAllPages()
+	// Cheap periodic re-enable handles newly-opened tabs. RuntimeEnable is
+	// idempotent server-side, so spamming it is harmless.
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			enableRuntimeOnAllPages()
+		}
+	}()
+
+	enc := json.NewEncoder(f)
+
+	wait := browser.EachEvent(
+		func(e *proto.RuntimeConsoleAPICalled) {
+			parts := make([]string, 0, len(e.Args))
+			for _, a := range e.Args {
+				parts = append(parts, renderConsoleArg(a))
+			}
+			entry := consoleLogEntry{
+				TS:    time.Now().UTC().Format(time.RFC3339Nano),
+				Src:   "console",
+				Level: string(e.Type),
+				Text:  strings.Join(parts, " "),
+			}
+			if e.StackTrace != nil && len(e.StackTrace.CallFrames) > 0 {
+				cf := e.StackTrace.CallFrames[0]
+				if cf.URL != "" {
+					entry.Loc = fmt.Sprintf("%s:%d", cf.URL, cf.LineNumber)
+				}
+			}
+			_ = enc.Encode(entry)
+		},
+		func(e *proto.RuntimeExceptionThrown) {
+			text := e.ExceptionDetails.Text
+			if e.ExceptionDetails.Exception != nil && e.ExceptionDetails.Exception.Description != "" {
+				text = text + ": " + e.ExceptionDetails.Exception.Description
+			}
+			entry := consoleLogEntry{
+				TS:    time.Now().UTC().Format(time.RFC3339Nano),
+				Src:   "exception",
+				Level: "error",
+				Text:  text,
+			}
+			if e.ExceptionDetails.URL != "" {
+				entry.Loc = fmt.Sprintf("%s:%d", e.ExceptionDetails.URL, e.ExceptionDetails.LineNumber)
+			}
+			_ = enc.Encode(entry)
+		},
+	)
+	wait()
+	os.Exit(0)
+}
+
+// cmdConsole reads the JSON-Lines file written by the sidecar and prints
+// filtered entries to stdout.
+func cmdConsole(args []string) {
+	fs := flag.NewFlagSet("console", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	pattern := fs.String("pattern", "", "")
+	limit := fs.Int("limit", 50, "")
+	errorsOnly := fs.Bool("errors-only", false, "")
+	clear := fs.Bool("clear", false, "")
+	raw := fs.Bool("raw", false, "")
+	if err := fs.Parse(args); err != nil {
+		fatal("invalid flag: %v", err)
+	}
+
+	path := consoleLogPath()
+
+	if *clear {
+		if err := os.WriteFile(path, []byte{}, 0644); err != nil {
+			fatal("failed to clear console log: %v", err)
+		}
+		fmt.Println("Console log cleared")
+		return
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return // no entries yet — silent
+		}
+		fatal("failed to open console log: %v", err)
+	}
+	defer f.Close()
+
+	var re *regexp.Regexp
+	if *pattern != "" {
+		re, err = regexp.Compile(*pattern)
+		if err != nil {
+			fatal("invalid --pattern regex: %v", err)
+		}
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var entries []consoleLogEntry
+	for scanner.Scan() {
+		var entry consoleLogEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		if *errorsOnly && entry.Level != "error" {
+			continue
+		}
+		if re != nil && !re.MatchString(entry.Text) {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+
+	if *limit > 0 && len(entries) > *limit {
+		entries = entries[len(entries)-*limit:]
+	}
+
+	for _, entry := range entries {
+		if *raw {
+			b, _ := json.Marshal(entry)
+			fmt.Println(string(b))
+			continue
+		}
+		ts := entry.TS
+		if t, err := time.Parse(time.RFC3339Nano, entry.TS); err == nil {
+			ts = t.Local().Format("15:04:05.000")
+		}
+		loc := ""
+		if entry.Loc != "" {
+			loc = " (" + entry.Loc + ")"
+		}
+		fmt.Printf("[%s] %s/%s: %s%s\n", ts, entry.Src, entry.Level, entry.Text, loc)
+	}
 }

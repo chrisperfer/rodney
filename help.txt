@@ -63,6 +63,13 @@ Accessibility:
   rodney ax-find [--name N] [--role R] [--json]  Find accessible nodes
   rodney ax-node <selector> [--json]        Show accessibility info for element
 
+Console capture:
+  rodney console [--pattern <re>] [--limit N] [--errors-only] [--raw]
+                                  Print captured console messages and
+                                  uncaught exceptions from the active
+                                  session. Defaults to last 50.
+  rodney console --clear          Clear the captured console log
+
 Options:
   --local                         Use directory-scoped session (./.rodney/)
   --global                        Use global session (~/.rodney/)
