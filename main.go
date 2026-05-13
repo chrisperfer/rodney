@@ -737,10 +737,38 @@ func cmdPDF(args []string) {
 }
 
 func cmdJS(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney js <expression>")
+	fs := flag.NewFlagSet("js", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	file := fs.String("file", "", "")
+	if err := fs.Parse(args); err != nil {
+		fatal("invalid flag: %v", err)
 	}
-	expr := strings.Join(args, " ")
+	rest := fs.Args()
+
+	var expr string
+	switch {
+	case *file != "":
+		data, err := os.ReadFile(*file)
+		if err != nil {
+			fatal("failed to read --file %s: %v", *file, err)
+		}
+		expr = string(data)
+	case len(rest) == 1 && rest[0] == "-":
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fatal("failed to read stdin: %v", err)
+		}
+		expr = string(data)
+	case len(rest) >= 1:
+		expr = strings.Join(rest, " ")
+	default:
+		fatal("usage: rodney js <expression> | - | --file <path>")
+	}
+
+	if strings.TrimSpace(expr) == "" {
+		fatal("empty JS expression")
+	}
+
 	_, _, page := withPage()
 
 	// Wrap bare expressions in a function

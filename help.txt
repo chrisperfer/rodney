@@ -22,7 +22,7 @@ Page info:
   rodney pdf [file]               Save page as PDF
 
 Interaction:
-  rodney js <expression>          Evaluate JavaScript expression
+  rodney js <expr>|-|--file <p>   Evaluate JS (- reads stdin, --file reads from path)
   rodney click <selector>         Click an element
   rodney input <selector> <text>  Type text into an input field
   rodney clear <selector>         Clear an input field
