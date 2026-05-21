@@ -136,9 +136,11 @@ func removeState() {
 	os.Remove(statePath())
 }
 
-// connectBrowser connects to the running Chrome instance
+// connectBrowser connects to the running Chrome instance.
+// NoDefaultDevice prevents go-rod from emulating a 1280x800 desktop viewport
+// on every page — we want pages to render at the real window size.
 func connectBrowser(s *State) (*rod.Browser, error) {
-	browser := rod.New().ControlURL(s.DebugURL)
+	browser := rod.New().ControlURL(s.DebugURL).NoDefaultDevice()
 	if err := browser.Connect(); err != nil {
 		return nil, fmt.Errorf("failed to connect to browser (is it still running?): %w", err)
 	}
@@ -393,10 +395,11 @@ func cmdStart(args []string) {
 		UserDataDir(dataDir).
 		Headless(headless)
 
-	// When in non-headless mode, make sure that we show the startup window immediately
-	// (instead of showing a window only after calling "rodney open")
+	// When in non-headless mode, show the startup window immediately and
+	// open it maximized so users don't get a small fixed-size window.
 	if !headless {
 		l = l.Delete("no-startup-window")
+		l = l.Set("start-maximized")
 	}
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
@@ -503,7 +506,7 @@ func cmdConnect(args []string) {
 	}
 
 	// Verify the connection works
-	browser := rod.New().ControlURL(info.WebSocketDebuggerURL)
+	browser := rod.New().ControlURL(info.WebSocketDebuggerURL).NoDefaultDevice()
 	if err := browser.Connect(); err != nil {
 		fatal("could not connect to browser: %v", err)
 	}
@@ -2099,7 +2102,10 @@ func cmdInternalConsoleLogger(args []string) {
 	}
 	defer f.Close()
 
-	browser := rod.New().ControlURL(debugURL)
+	// NoDefaultDevice: don't apply 1280x800 desktop emulation to live pages.
+	// The console-logger only reads runtime events, but the rod browser
+	// instance still touches each page's emulation settings on connect.
+	browser := rod.New().ControlURL(debugURL).NoDefaultDevice()
 	if err := browser.Connect(); err != nil {
 		os.Exit(2)
 	}
