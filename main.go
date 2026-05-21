@@ -1237,12 +1237,21 @@ func cmdScreenshot(args []string) {
 	if err != nil {
 		fatal("failed to set viewport: %v", err)
 	}
+	// Always clear the override before exit, regardless of whether Screenshot
+	// succeeded or fataled. Without this the viewport stays pinned at the
+	// screenshot dimensions for every subsequent interaction in this tab.
+	// Note: defer alone is insufficient because fatal() calls os.Exit, which
+	// skips deferred calls.
+	clearOverride := func() { proto.EmulationClearDeviceMetricsOverride{}.Call(page) }
+	defer clearOverride()
 
 	data, err := page.Screenshot(fullPage, nil)
 	if err != nil {
+		clearOverride()
 		fatal("screenshot failed: %v", err)
 	}
 	if err := os.WriteFile(file, data, 0644); err != nil {
+		clearOverride()
 		fatal("failed to write screenshot: %v", err)
 	}
 	fmt.Println(file)
