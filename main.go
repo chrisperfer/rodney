@@ -486,6 +486,7 @@ func cmdStart(args []string) {
 	if !headless {
 		l = l.Delete("no-startup-window")
 		l = l.Set("start-maximized")
+		l = l.Set("profile-directory", "Default")
 	}
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
