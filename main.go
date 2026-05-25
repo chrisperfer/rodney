@@ -43,6 +43,11 @@ const (
 // activeStateDir is set once at startup based on --local/--global flags.
 var activeStateDir string
 
+// pageOverride, when non-empty, targets a specific tab for this one command
+// instead of the saved active page. It is a numeric index or a case-insensitive
+// URL/title substring. It is transient: never written back to state.json.
+var pageOverride string
+
 // extractScopeArgs scans args for --local/--global, removes them, and returns the mode.
 // If both appear, the last one wins.
 func extractScopeArgs(args []string) (scopeMode, []string) {
@@ -59,6 +64,62 @@ func extractScopeArgs(args []string) (scopeMode, []string) {
 		}
 	}
 	return mode, filtered
+}
+
+// extractPageArg scans args for `--page <val>` or `--page=<val>`, removes them,
+// and returns the value (empty if absent). The last occurrence wins.
+func extractPageArg(args []string) (string, []string) {
+	override := ""
+	var filtered []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--page":
+			if i+1 < len(args) {
+				override = args[i+1]
+				i++ // consume the value token
+			}
+		case strings.HasPrefix(arg, "--page="):
+			override = strings.TrimPrefix(arg, "--page=")
+		default:
+			filtered = append(filtered, arg)
+		}
+	}
+	return override, filtered
+}
+
+// pageRef is the minimal tab info resolvePageIndex needs (kept browser-free for testing).
+type pageRef struct {
+	URL   string
+	Title string
+}
+
+// resolvePageIndex maps a --page override to an index into refs. The override is
+// either a numeric index or a case-insensitive substring matched against URL/title.
+// A substring that matches zero or multiple tabs is an error.
+func resolvePageIndex(refs []pageRef, override string) (int, error) {
+	if idx, err := strconv.Atoi(override); err == nil {
+		if idx < 0 || idx >= len(refs) {
+			return 0, fmt.Errorf("--page index %d out of range (0-%d)", idx, len(refs)-1)
+		}
+		return idx, nil
+	}
+	needle := strings.ToLower(override)
+	var matches []int
+	for i, r := range refs {
+		if strings.Contains(strings.ToLower(r.URL), needle) ||
+			strings.Contains(strings.ToLower(r.Title), needle) {
+			matches = append(matches, i)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return 0, fmt.Errorf("--page %q matched no open tab", override)
+	case 1:
+		return matches[0], nil
+	default:
+		return 0, fmt.Errorf("--page %q matched %d tabs; be more specific", override, len(matches))
+	}
 }
 
 // resolveStateDir determines the state directory based on scope mode and working directory.
@@ -85,9 +146,10 @@ type State struct {
 	ChromePID        int    `json:"chrome_pid"`
 	ActivePage       int    `json:"active_page"` // index into pages list
 	DataDir          string `json:"data_dir"`
-	ProxyPID         int    `json:"proxy_pid,omitempty"`           // PID of auth proxy helper
-	ProxyPort        int    `json:"proxy_port,omitempty"`          // local port of auth proxy
-	ConsoleLoggerPID int    `json:"console_logger_pid,omitempty"` // PID of console-capture sidecar
+	ProxyPID         int    `json:"proxy_pid,omitempty"`            // PID of auth proxy helper
+	ProxyPort        int    `json:"proxy_port,omitempty"`           // local port of auth proxy
+	ConsoleLoggerPID int    `json:"console_logger_pid,omitempty"`   // PID of console-capture sidecar
+	NoCacheDisabled  bool   `json:"no_cache_disabled,omitempty"`    // re-apply Network.setCacheDisabled on every command
 }
 
 func stateDir() string {
@@ -157,6 +219,19 @@ func getActivePage(browser *rod.Browser, s *State) (*rod.Page, error) {
 		return nil, fmt.Errorf("no pages open")
 	}
 	idx := s.ActivePage
+	if pageOverride != "" {
+		refs := make([]pageRef, len(pages))
+		for i, p := range pages {
+			if info, _ := p.Info(); info != nil {
+				refs[i] = pageRef{URL: info.URL, Title: info.Title}
+			}
+		}
+		resolved, err := resolvePageIndex(refs, pageOverride)
+		if err != nil {
+			return nil, err
+		}
+		idx = resolved
+	}
 	if idx < 0 || idx >= len(pages) {
 		idx = 0
 	}
@@ -195,8 +270,10 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Extract --local/--global from all args before dispatching
+	// Extract --local/--global and --page from all args before dispatching, so
+	// they work in any position (before or after the command).
 	mode, cleanedArgs := extractScopeArgs(os.Args[1:])
+	pageOverride, cleanedArgs = extractPageArg(cleanedArgs)
 	if len(cleanedArgs) == 0 {
 		printUsage()
 		os.Exit(1)
@@ -236,6 +313,8 @@ func main() {
 		cmdReload(args)
 	case "clear-cache":
 		cmdClearCache(args)
+	case "no-cache":
+		cmdNoCache(args)
 	case "url":
 		cmdURL(args)
 	case "title":
@@ -341,6 +420,13 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 	page, err := getActivePage(browser, s)
 	if err != nil {
 		fatal("%v", err)
+	}
+	// Re-apply cache-disabled each command so it persists across rodney's
+	// connect-per-command model (CDP state is per-session, so a one-shot set
+	// wouldn't survive). Best-effort: a failure here shouldn't block the command.
+	if s.NoCacheDisabled {
+		_ = (proto.NetworkEnable{}).Call(page)
+		_ = (proto.NetworkSetCacheDisabled{CacheDisabled: true}).Call(page)
 	}
 	// Apply default timeout so element queries don't hang forever
 	page = page.Timeout(defaultTimeout)
@@ -674,6 +760,39 @@ func cmdClearCache(args []string) {
 		fatal("clear cache failed: %v", err)
 	}
 	fmt.Println("Browser cache cleared")
+}
+
+// cmdNoCache toggles HTTP-cache-disabled for the session. The flag is stored in
+// state and re-applied by withPage on every subsequent command, so it persists
+// across reloads despite rodney connecting fresh each invocation.
+func cmdNoCache(args []string) {
+	on := true
+	if len(args) > 0 {
+		switch strings.ToLower(args[0]) {
+		case "on", "true", "1", "yes":
+			on = true
+		case "off", "false", "0", "no":
+			on = false
+		default:
+			fatal("usage: rodney no-cache <on|off>")
+		}
+	}
+	s, _, page := withPage()
+	if err := (proto.NetworkEnable{}).Call(page); err != nil {
+		fatal("failed to enable network domain: %v", err)
+	}
+	if err := (proto.NetworkSetCacheDisabled{CacheDisabled: on}).Call(page); err != nil {
+		fatal("set cache-disabled failed: %v", err)
+	}
+	s.NoCacheDisabled = on
+	if err := saveState(s); err != nil {
+		fatal("failed to save state: %v", err)
+	}
+	if on {
+		fmt.Println("HTTP cache disabled (re-applied on every command until 'no-cache off')")
+	} else {
+		fmt.Println("HTTP cache re-enabled")
+	}
 }
 
 func cmdURL(args []string) {

@@ -12,6 +12,8 @@ Navigation:
   rodney forward                  Go forward in history
   rodney reload [--hard]          Reload page (--hard bypasses cache)
   rodney clear-cache              Clear the browser cache
+  rodney no-cache <on|off>        Disable/enable HTTP cache for the session
+                                  (persists across reloads; set once after start)
 
 Page info:
   rodney url                      Print current URL
@@ -73,6 +75,10 @@ Console capture:
 Options:
   --local                         Use directory-scoped session (./.rodney/)
   --global                        Use global session (~/.rodney/)
+  --page <idx|substring>          Target a specific tab for THIS command only
+                                  (numeric index, or case-insensitive URL/title
+                                  substring). Does not change the active page.
+                                  Works with js, click, input, exists, etc.
   --version                       Print version and exit
   --help, -h, help                Show this help message
 
