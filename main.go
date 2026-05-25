@@ -386,6 +386,7 @@ func cmdStart(args []string) {
 	// (instead of showing a window only after calling "rodney open")
 	if !headless {
 		l = l.Delete("no-startup-window")
+		l = l.Set("profile-directory", "Default")
 	}
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
