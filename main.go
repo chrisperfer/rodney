@@ -477,6 +477,14 @@ func cmdStart(args []string) {
 		Set("no-sandbox").
 		Set("disable-gpu").
 		Set("single-process"). // Required for screenshots in gVisor/container environments
+		// Effectively disable the disk and media caches at the Chrome process
+		// level. Browser-UI reloads, DevTools reloads, and scripted reloads all
+		// honor this — unlike CDP's Network.setCacheDisabled, which is target-
+		// scoped and can desync from the visible DevTools checkbox state. This
+		// matches the developer expectation that rodney sessions never serve
+		// stale assets.
+		Set("disk-cache-size", "1").
+		Set("media-cache-size", "1").
 		Leakless(false).        // Keep Chrome alive after CLI exits
 		UserDataDir(dataDir).
 		Headless(headless)
@@ -556,6 +564,12 @@ func cmdStart(args []string) {
 		ProxyPID:         proxyPID,
 		ProxyPort:        proxyPort,
 		ConsoleLoggerPID: consoleLoggerPID,
+		// HTTP cache off by default. Toggle with `rodney no-cache off` if you
+		// need cache-on for a session (rare — usually only when testing cache
+		// behavior itself). The per-command re-apply (line ~427) plus the
+		// console-logger's periodic per-page enforcement together make this
+		// hold across browser-UI reloads, not just rodney-driven navigation.
+		NoCacheDisabled: true,
 	}
 
 	if err := saveState(state); err != nil {
@@ -2243,21 +2257,39 @@ func cmdInternalConsoleLogger(args []string) {
 	// console events only fire from sessions where Runtime.enable was called.
 	// Enable it on every currently-open page. Pages opened later (rodney
 	// newpage, popups) are picked up by the periodic refresh below.
-	enableRuntimeOnAllPages := func() {
+	//
+	// We also (re-)apply Network.setCacheDisabled here when the persisted
+	// no-cache flag is on. The sidecar's CDP session is long-lived, so the
+	// flag stays asserted for the page's lifetime — which is what makes
+	// browser-UI reloads (F5) and DevTools reloads bypass cache, not just
+	// rodney-driven navigation. The per-command re-apply (cmdStart's
+	// connect-per-command path) only covers rodney-initiated work.
+	applyPerPageHooks := func() {
+		// Re-read state on every tick so `rodney no-cache off` takes effect
+		// without bouncing the sidecar.
+		noCache := false
+		if s, err := loadState(); err == nil {
+			noCache = s.NoCacheDisabled
+		}
 		if pages, err := browser.Pages(); err == nil {
 			for _, p := range pages {
 				_ = proto.RuntimeEnable{}.Call(p)
+				if noCache {
+					_ = proto.NetworkEnable{}.Call(p)
+					_ = proto.NetworkSetCacheDisabled{CacheDisabled: true}.Call(p)
+				}
 			}
 		}
 	}
-	enableRuntimeOnAllPages()
-	// Cheap periodic re-enable handles newly-opened tabs. RuntimeEnable is
-	// idempotent server-side, so spamming it is harmless.
+	applyPerPageHooks()
+	// Cheap periodic re-apply handles newly-opened tabs and state changes.
+	// Both RuntimeEnable and NetworkSetCacheDisabled are idempotent server-
+	// side, so spamming them is harmless.
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for range t.C {
-			enableRuntimeOnAllPages()
+			applyPerPageHooks()
 		}
 	}()
 
